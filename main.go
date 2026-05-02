@@ -44,16 +44,21 @@ func listRepos(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResul
 func getRepo(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	owner, err := req.RequireString("owner")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return mcp.NewToolResultError("Missing required parameter 'owner' (GitHub username). Example: 'torvalds', 'octocat'. First call list_repos(username) if you need to find valid repository names."), nil
 	}
 	repo, err := req.RequireString("repo")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return mcp.NewToolResultError("Missing required parameter 'repo' (repository name). Example: 'linux', 'Hello-World'. First call list_repos(owner) if you need to find valid repository names."), nil
 	}
 
 	detail, err := githubClient.GetRepo(ctx, owner, repo)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		// Check if it's a "not found" error the AI can recover from
+		if strings.Contains(err.Error(), "not found") {
+			return mcp.NewToolResultError(fmt.Sprintf("Repository '%s/%s' does not exist. Recovery steps: (1) Call list_repos('%s') to find valid repositories, or (2) Check that the owner and repo names are spelled correctly.", owner, repo, owner)), nil
+		}
+		// For other errors (network, auth, rate limit), provide context
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to fetch repository details: %s", err.Error())), nil
 	}
 
 	desc := detail.Description
@@ -77,7 +82,7 @@ func getRepo(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult,
 func searchRepos(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	query, err := req.RequireString("query")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return mcp.NewToolResultError("Missing required parameter 'query' (search keywords). Examples: 'kubernetes', 'http server', 'machine learning'. Be specific — broad queries like 'code' may not return useful results."), nil
 	}
 
 	language := optString(req, "language")
@@ -86,7 +91,11 @@ func searchRepos(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRes
 
 	results, err := githubClient.SearchRepos(ctx, query, language, sortBy, limit)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		// Distinguish recoverable vs non-recoverable errors
+		if strings.Contains(err.Error(), "rate limit") {
+			return mcp.NewToolResultError(fmt.Sprintf("Rate limit exceeded: %s. Recovery: Wait a few minutes before retrying, or provide a GitHub personal access token for higher limits.", err.Error())), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("Search failed: %s", err.Error())), nil
 	}
 
 	if len(results) == 0 {
@@ -108,12 +117,15 @@ func searchRepos(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRes
 func getUserProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	username, err := req.RequireString("username")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return mcp.NewToolResultError("Missing required parameter 'username' (GitHub login). Example: 'torvalds', 'octocat'. This should be the user's login name, not their display name."), nil
 	}
 
 	p, err := githubClient.GetUserProfile(ctx, username)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		if strings.Contains(err.Error(), "not found") {
+			return mcp.NewToolResultError(fmt.Sprintf("User '%s' does not exist on GitHub. Verify the username is spelled correctly and is a valid GitHub account (case-sensitive).", username)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to fetch user profile: %s", err.Error())), nil
 	}
 
 	name := p.Name
@@ -137,12 +149,15 @@ func getUserProfile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 func summarizeUser(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	username, err := req.RequireString("username")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return mcp.NewToolResultError("Missing required parameter 'username' (GitHub login). Example: 'torvalds', 'octocat'."), nil
 	}
 
 	s, err := githubClient.SummarizeUser(ctx, username)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		if strings.Contains(err.Error(), "not found") {
+			return mcp.NewToolResultError(fmt.Sprintf("User '%s' does not exist. This error may also occur if the user has no public repositories. Verify the username and try again.", username)), nil
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to summarize user: %s", err.Error())), nil
 	}
 
 	langs := "(none)"
@@ -161,9 +176,31 @@ func main() {
 
 	s := server.NewMCPServer("github-mcp", "1.0.0")
 
+	// Server-wide usage rules
+	const serverRules = `
+## GitHub MCP Server — Usage Rules
+
+**Before you call any tool:**
+1. Always start with list_repos or get_user_profile to verify the username exists
+2. Use get_repo or summarize_user only after confirming the user exists
+3. search_repos is discovery — use get_repo for deep details on known repos
+
+**Error handling:**
+- "not found" errors are recoverable: call list_repos to find valid names
+- "rate limit" errors are recoverable: wait a few minutes and retry
+- "network error" or "authentication failed" are temporary: retry after a short delay
+- Do NOT retry with identical parameters if you get the same error twice
+
+**Avoiding infinite loops:**
+- If a call fails with "not found", switch to list_repos or search_repos — don't retry get_repo with the same parameters
+- If a call fails with "rate limit", wait and try a different query or tool
+- If a call fails twice identically, report the error to the user instead of looping
+`
+	_ = serverRules // TODO: make this available to clients
+
 	s.AddTool(
 		mcp.NewTool("list_repos",
-			mcp.WithDescription("List up to 10 public repository names for a GitHub user. Use this for a quick overview of what repos a user has. Returns only names — use get_repo for full details on a specific repo."),
+			mcp.WithDescription("List up to 10 public repository names for a GitHub user. Use this for a quick overview of what repos a user has. Returns only names — use get_repo for full details on a specific repo. USAGE RULE: Always call this before get_repo if you don't know the exact repo name."),
 			mcp.WithString("username", mcp.Required(), mcp.Description("GitHub login (e.g. 'torvalds', 'octocat')")),
 		),
 		listRepos,
@@ -171,36 +208,36 @@ func main() {
 
 	s.AddTool(
 		mcp.NewTool("get_repo",
-			mcp.WithDescription("Fetch full metadata for a single GitHub repository. Use when you know the exact owner and repo name and need details like star count, forks, open issues, primary language, description, default branch, or last updated time. Not for discovery — use search_repos if the exact name is unknown."),
+			mcp.WithDescription("Fetch full metadata for a single GitHub repository. Use when you know the exact owner and repo name and need details like star count, forks, open issues, primary language, description, default branch, or last updated time. USAGE RULE: Only call this if you've already verified the repo exists via list_repos or search_repos. If you get a 'not found' error, call list_repos to find the correct repo name."),
 			mcp.WithString("owner", mcp.Required(), mcp.Description("GitHub login of the repo owner (e.g. 'torvalds')")),
-			mcp.WithString("repo", mcp.Required(), mcp.Description("Exact repository name (e.g. 'linux')")),
+			mcp.WithString("repo", mcp.Required(), mcp.Description("Exact repository name (e.g. 'linux'). Case-sensitive. If you're unsure, call list_repos(owner) first.")),
 		),
 		getRepo,
 	)
 
 	s.AddTool(
 		mcp.NewTool("search_repos",
-			mcp.WithDescription("Search GitHub repositories by keyword. Use when the user wants to discover repos matching a topic, technology, or project name rather than looking up a known repo. Optionally filter by language (e.g. 'go', 'python', 'rust') and sort by 'stars', 'forks', or 'updated'. Example: query='kubernetes operator', language='go', sort='stars', limit=5."),
-			mcp.WithString("query", mcp.Required(), mcp.Description("Search keywords (e.g. 'http server', 'machine learning framework')")),
-			mcp.WithString("language", mcp.Description("Filter by primary programming language (e.g. 'go', 'python', 'typescript'). Omit to search all languages.")),
-			mcp.WithString("sort", mcp.Description("Sort order: 'stars' (default), 'forks', or 'updated'")),
-			mcp.WithNumber("limit", mcp.Description("Number of results to return (1-20, default 10)")),
+			mcp.WithDescription("Search GitHub repositories by keyword for discovery. Use when the user wants to find repos matching a topic or technology, or when you don't know the exact repo name. Supports optional language filter and sort by 'stars', 'forks', or 'updated'. Example: search for 'kubernetes operator' in Go sorted by stars. After discovering a repo, use get_repo for full details."),
+			mcp.WithString("query", mcp.Required(), mcp.Description("Search keywords (e.g. 'http server', 'machine learning framework'). Be specific — avoid single words like 'code' or 'app' which return too many results.")),
+			mcp.WithString("language", mcp.Description("Filter by primary programming language (e.g. 'go', 'python', 'typescript', 'javascript'). Omit to search all languages.")),
+			mcp.WithString("sort", mcp.Description("Sort order: 'stars' (default, most popular first), 'forks' (most forked), or 'updated' (recently changed).")),
+			mcp.WithNumber("limit", mcp.Description("Number of results to return (1-20, default 10). Lower limits are faster.")),
 		),
 		searchRepos,
 	)
 
 	s.AddTool(
 		mcp.NewTool("get_user_profile",
-			mcp.WithDescription("Fetch a GitHub user's public profile: display name, bio, company, location, follower count, following count, and total public repo count. Use when the user asks who someone is or wants identity/social info. NOT for listing repos — use list_repos for that."),
-			mcp.WithString("username", mcp.Required(), mcp.Description("GitHub login (e.g. 'torvalds')")),
+			mcp.WithDescription("Fetch a GitHub user's public profile (name, bio, location, followers, repo count, etc). Use this to answer 'who is X' questions or learn about a developer's identity. USAGE RULE: Call this before list_repos to verify the user exists. If you get a 'not found' error, the user doesn't exist on GitHub."),
+			mcp.WithString("username", mcp.Required(), mcp.Description("GitHub login (e.g. 'torvalds', 'octocat'). This is the user's username, not their display name. Case-sensitive.")),
 		),
 		getUserProfile,
 	)
 
 	s.AddTool(
 		mcp.NewTool("summarize_user",
-			mcp.WithDescription("Aggregate statistics across all public repos for a GitHub user: total repo count, cumulative star count, and a ranked breakdown of programming languages used. Use when the user asks for a high-level overview of a developer's GitHub presence or tech stack. More comprehensive than list_repos — fetches up to 100 repos to compute the summary."),
-			mcp.WithString("username", mcp.Required(), mcp.Description("GitHub login (e.g. 'torvalds')")),
+			mcp.WithDescription("Aggregate high-level statistics across a user's public repos: total repos, total stars across all repos, and language breakdown. Use when the user asks for an overview of a developer's presence or tech stack. This tool fetches up to 100 repos, so it's slower but more comprehensive than list_repos. USAGE RULE: Call get_user_profile first to verify the user exists."),
+			mcp.WithString("username", mcp.Required(), mcp.Description("GitHub login (e.g. 'torvalds'). Case-sensitive.")),
 		),
 		summarizeUser,
 	)

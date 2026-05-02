@@ -61,7 +61,7 @@ func NewGitHubClient(baseURL, apiKey string) *GitHubClient {
 func (gc *GitHubClient) do(ctx context.Context, url string, out interface{}) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("network error: failed to create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	if gc.apiKey != "" {
@@ -70,17 +70,28 @@ func (gc *GitHubClient) do(ctx context.Context, url string, out interface{}) err
 
 	resp, err := gc.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return fmt.Errorf("network error: could not reach GitHub API. Check your internet connection or try again later.")
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("github api error: %s %s", resp.Status, string(body))
+		switch resp.StatusCode {
+		case 404:
+			return fmt.Errorf("not found: the resource you requested does not exist. Verify the owner and repository name are spelled correctly (e.g., 'octocat/Hello-World'). Use list_repos to discover valid repository names.")
+		case 401:
+			return fmt.Errorf("authentication failed: invalid or expired API credentials. If using a personal access token, verify it has the correct scopes (repo, public_repo).")
+		case 403:
+			return fmt.Errorf("access denied: you may have exceeded GitHub's rate limit (60 requests/hour unauthenticated, 5000/hour authenticated). Wait before retrying, or provide a GitHub personal access token for higher limits.")
+		case 422:
+			return fmt.Errorf("invalid request: the parameters or query format is incorrect. Check that usernames, repo names, and search syntax are valid.")
+		default:
+			return fmt.Errorf("github api error (HTTP %d): %s. Check the GitHub API documentation if the error persists.", resp.StatusCode, string(body))
+		}
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		return fmt.Errorf("failed to parse response: %w", err)
+		return fmt.Errorf("parsing error: the GitHub API returned unexpected data. This may be a temporary issue. Try again in a few seconds.")
 	}
 	return nil
 }
