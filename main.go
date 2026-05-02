@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"os"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -242,7 +244,53 @@ func main() {
 		summarizeUser,
 	)
 
-	if err := server.ServeStdio(s); err != nil {
+	// Check transport mode from environment
+	transport := os.Getenv("MCP_TRANSPORT")
+	if transport == "" {
+		transport = "stdio" // Default to stdio
+	}
+
+	switch transport {
+	case "http":
+		addr := os.Getenv("MCP_LISTEN_ADDR")
+		if addr == "" {
+			addr = ":8000"
+		}
+		startHTTPMode(s, addr)
+	case "stdio":
+		if err := server.ServeStdio(s); err != nil {
+			panic(err)
+		}
+	default:
+		panic(fmt.Sprintf("unknown transport: %s (must be 'stdio' or 'http')", transport))
+	}
+}
+
+// startHTTPMode starts the MCP server in HTTP mode with a health check endpoint
+func startHTTPMode(s *server.MCPServer, addr string) {
+	mux := http.NewServeMux()
+
+	// Health check endpoint
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	// MCP endpoint
+	httpServer := server.NewStreamableHTTPServer(s)
+	mux.Handle("/mcp", httpServer)
+
+	// Log startup
+	fmt.Fprintf(os.Stderr, "Starting GitHub MCP server on http://localhost%s\n", addr)
+	fmt.Fprintf(os.Stderr, "  MCP endpoint: http://localhost%s/mcp\n", addr)
+	fmt.Fprintf(os.Stderr, "  Health check: http://localhost%s/healthz\n", addr)
+
+	if err := http.ListenAndServe(addr, mux); err != nil {
 		panic(err)
 	}
 }
