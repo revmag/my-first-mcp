@@ -291,6 +291,8 @@ func startHTTPMode(s *server.MCPServer, addr string) {
 	fmt.Fprintf(os.Stderr, "  Health check: http://localhost%s/healthz\n", addr)
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to start HTTP server: %v\n", err)
+		os.Stderr.Sync()
 		panic(err)
 	}
 }
